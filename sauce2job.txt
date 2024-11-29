@@ -1,0 +1,1487 @@
+USE [msdb]
+GO
+
+/****** Object:  Job [2_Leads_Import]    Script Date: 11/29/2024 1:10:04 PM ******/
+BEGIN TRANSACTION
+DECLARE @ReturnCode INT
+SELECT @ReturnCode = 0
+/****** Object:  JobCategory [[Uncategorized (Local)]]    Script Date: 11/29/2024 1:10:04 PM ******/
+IF NOT EXISTS (SELECT name FROM msdb.dbo.syscategories WHERE name=N'[Uncategorized (Local)]' AND category_class=1)
+BEGIN
+EXEC @ReturnCode = msdb.dbo.sp_add_category @class=N'JOB', @type=N'LOCAL', @name=N'[Uncategorized (Local)]'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+
+END
+
+DECLARE @jobId BINARY(16)
+EXEC @ReturnCode =  msdb.dbo.sp_add_job @job_name=N'2_Leads_Import', 
+		@enabled=1, 
+		@notify_level_eventlog=0, 
+		@notify_level_email=0, 
+		@notify_level_netsend=0, 
+		@notify_level_page=0, 
+		@delete_level=0, 
+		@description=N'No description available.', 
+		@category_name=N'[Uncategorized (Local)]', 
+		@owner_login_name=N'sa', @job_id = @jobId OUTPUT
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Clean error Logs, Drop Sauce2 tables]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Clean error Logs, Drop Sauce2 tables', 
+		@step_id=1, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'
+USE Raw_Data
+
+
+
+delete from [dbo].[Insertion_Errors];
+
+delete from dbo.ExceptionLog;
+
+-- delete from [dbo].[ProcessedFilesLog];
+
+
+  IF OBJECT_ID(''dbo.Sauce2'', ''U'') IS NOT NULL 
+  DROP TABLE dbo.Sauce2; 
+', 
+		@database_name=N'Raw_Data', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Insert Excel Leads into Sauce Tables.]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Insert Excel Leads into Sauce Tables.', 
+		@step_id=2, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'CmdExec', 
+		@command=N'cmd.exe /c ""D:\PythonScripts\.venv\Scripts\python.exe" "D:\PythonScripts\Sauce2.py" > "C:\OneDriveTemp\output.log2" 2>&1"
+', 
+		@flags=16
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Create table Sauce2_Stg]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Create table Sauce2_Stg', 
+		@step_id=3, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'--SET NOCOUNT ON;
+BEGIN TRY
+    -- Start a transaction
+    BEGIN TRANSACTION;
+
+    -- Create a logging table for exception handling
+    IF NOT EXISTS (SELECT * FROM sys.objects 
+                   WHERE object_id = OBJECT_ID(N''[dbo].[ExceptionLog]'') AND type IN (N''U''))
+    BEGIN
+        CREATE TABLE ExceptionLog (
+            LogID INT IDENTITY(1,1) PRIMARY KEY,
+            LogDateTime DATETIME DEFAULT GETDATE(),
+            ExceptionMessage NVARCHAR(MAX),
+            Step NVARCHAR(100),
+            TransactionID UNIQUEIDENTIFIER NULL -- To capture the transaction context
+        )
+    END
+
+    -- =====================================
+    -- Check if Sauce2_Stg exists and update intelligently
+    -- =====================================
+    
+    DECLARE @results TABLE
+    (
+        ID VARCHAR(36),
+        TableName VARCHAR(250),
+        ColumnName VARCHAR(250),
+        DataType VARCHAR(250),
+        MaxLength VARCHAR(250),
+        Longest VARCHAR(250),
+        SQLText VARCHAR(MAX)
+    )
+
+    -- Insert column info and dynamic SQL for each column
+    INSERT INTO @results(ID, TableName, ColumnName, DataType, MaxLength, Longest, SQLText)
+    SELECT 
+        NEWID(),
+        OBJECT_NAME(c.object_id),
+        c.name,
+        t.name,
+        CASE 
+            WHEN t.name != ''varchar'' THEN ''NA''
+            WHEN c.max_length = -1 THEN ''Max'' 
+            ELSE CAST(c.max_length AS VARCHAR)
+        END,
+        ''NA'',
+        ''SELECT MAX(LEN(ISNULL('' + QUOTENAME(c.name) + '',0))) FROM '' + QUOTENAME(OBJECT_SCHEMA_NAME(c.object_id)) + ''.'' + QUOTENAME(OBJECT_NAME(c.object_id))
+    FROM sys.columns c
+    INNER JOIN sys.types t ON c.system_type_id = t.system_type_id
+    WHERE c.object_id = OBJECT_ID(''Sauce2'')  -- Specify your table here
+
+    -- Execute the dynamic SQL to determine the longest length
+    DECLARE @id VARCHAR(36)
+    DECLARE @sql VARCHAR(MAX)
+    DECLARE @receiver TABLE(theCount INT)
+
+    DECLARE length_cursor CURSOR FOR 
+        SELECT ID, SQLText FROM @results WHERE MaxLength != ''NA''
+
+    OPEN length_cursor
+    FETCH NEXT FROM length_cursor INTO @id, @sql
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+        INSERT INTO @receiver (theCount)
+        EXEC(@sql)
+
+        UPDATE @results
+        SET Longest = (SELECT theCount FROM @receiver)
+        WHERE ID = @id
+
+        DELETE FROM @receiver
+        FETCH NEXT FROM length_cursor INTO @id, @sql
+    END
+
+    CLOSE length_cursor
+    DEALLOCATE length_cursor
+
+    -- ============================
+    -- Intelligent Handling of Sauce2_Stg
+    -- ============================
+
+    IF OBJECT_ID(''dbo.Sauce2_Stg'', ''U'') IS NOT NULL
+    BEGIN
+        -- Sauce2_Stg already exists, let''s update it intelligently
+
+        DECLARE @existingColumns TABLE
+        (
+            ColumnName VARCHAR(250),
+            DataType VARCHAR(250),
+            MaxLength INT
+        )
+        
+        -- Get the current structure of Sauce2_Stg
+        INSERT INTO @existingColumns(ColumnName, DataType, MaxLength)
+        SELECT 
+            c.name AS ColumnName,
+            t.name AS DataType,
+            CASE WHEN c.max_length = -1 THEN -1 ELSE c.max_length END AS MaxLength
+        FROM sys.columns c
+        JOIN sys.types t ON c.system_type_id = t.system_type_id
+        WHERE c.object_id = OBJECT_ID(''dbo.Sauce2_Stg'')
+
+        -- Now loop through the @results and intelligently update or create columns
+        DECLARE @columnName VARCHAR(250)
+        DECLARE @dataType VARCHAR(250)
+        DECLARE @maxLength VARCHAR(250)
+        DECLARE @longest VARCHAR(250)
+        DECLARE @alterSQL VARCHAR(MAX)
+        DECLARE @existingDataType VARCHAR(250)
+        DECLARE @existingMaxLength INT
+
+        DECLARE columns_cursor CURSOR FOR
+            SELECT ColumnName, DataType, MaxLength, ISNULL(Longest, 10)
+            FROM @results
+
+        OPEN columns_cursor
+        FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            -- Check if the column already exists
+            IF EXISTS (SELECT 1 FROM @existingColumns WHERE ColumnName = @columnName)
+            BEGIN
+                -- Column exists, check if data type matches and handle length change
+                SELECT @existingDataType = DataType, @existingMaxLength = MaxLength
+                FROM @existingColumns
+                WHERE ColumnName = @columnName
+
+                IF @existingDataType = @dataType AND @dataType = ''varchar''
+                BEGIN
+                    -- If it''s varchar, check if we need to update the size
+                    IF @longest > @existingMaxLength
+                    BEGIN
+                        -- Increase the column size
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ALTER COLUMN '' + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+                        EXEC(@alterSQL)
+                    END
+                END
+                ELSE IF @existingDataType != @dataType
+                BEGIN
+                    -- If there''s a type mismatch, create a new column with a unique name
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ADD '' + QUOTENAME(@columnName + ''_new'') + '' '' + @dataType
+                    EXEC(@alterSQL)
+                END
+				--PRINT(1)
+            END
+            ELSE
+            BEGIN
+                -- Column does not exist, so create it
+                IF @dataType = ''varchar''
+                BEGIN
+                    IF @maxLength = ''Max''
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + ''(MAX)''
+                    ELSE
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+                END
+                ELSE IF @dataType = ''datetime''
+                BEGIN
+                    -- Handle datetime columns, allowing NULLs if necessary
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + '' NULL''
+                END
+                ELSE
+                BEGIN
+                    -- Non-varchar and non-datetime types
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Stg ADD '' + QUOTENAME(@columnName) + '' '' + @dataType
+                END
+
+				
+		        SET @alterSQL = REPLACE(@alterSQL, ''(0)'', ''(100) '') + '';''
+                EXEC(@alterSQL)
+				--PRINT(2)
+            END
+
+            FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+        END
+
+        CLOSE columns_cursor
+        DEALLOCATE columns_cursor
+    END
+    ELSE
+    BEGIN
+        -- Sauce2_Stg does not exist, create it
+        DECLARE @createTableSQL VARCHAR(MAX)
+        SET @createTableSQL = ''CREATE TABLE dbo.Sauce2_Stg (''
+
+        DECLARE @firstColumn BIT
+        SET @firstColumn = 1
+
+        -- Loop through the @results to build the CREATE TABLE statement
+        DECLARE columns_cursor CURSOR FOR
+            SELECT ColumnName, DataType, MaxLength, ISNULL(Longest, 10)
+            FROM @results
+
+        OPEN columns_cursor
+        FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+            IF @firstColumn = 0
+                SET @createTableSQL = @createTableSQL + '',''
+
+            SET @firstColumn = 0
+
+            IF @dataType = ''varchar''
+            BEGIN
+                IF @maxLength = ''Max''
+                    SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + ''(MAX)''
+                ELSE
+                    SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+            END
+            ELSE IF @dataType = ''datetime''
+            BEGIN
+                -- Handle datetime columns, allowing NULLs if necessary
+                SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + '' NULL''
+            END
+            ELSE
+            BEGIN
+                -- Non-varchar and non-datetime columns
+                SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType
+            END
+
+            FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+        END
+
+        CLOSE columns_cursor
+        DEALLOCATE columns_cursor
+
+        -- Close CREATE TABLE statement
+       -- SET @createTableSQL = @createTableSQL + '');''
+		SET @createTableSQL = REPLACE(@createTableSQL, ''(0)'', ''(100) '') + '');''
+	
+
+        -- Execute the dynamic SQL to create the table
+        EXEC(@createTableSQL)
+		
+    END
+
+    -- Commit transaction if everything is successful
+    COMMIT TRANSACTION;
+    INSERT INTO ExceptionLog (ExceptionMessage, Step, TransactionID)
+    VALUES (''Successfully Executed Sauce2 Script'', ''COMMIT CHANGES END TRY BLOCK'', NEWID());
+END TRY
+BEGIN CATCH
+    -- Rollback in case of error
+    IF @@TRANCOUNT > 0
+    BEGIN
+        ROLLBACK TRANSACTION;
+    END
+
+    -- Log the error in ExceptionLog table
+    INSERT INTO ExceptionLog (ExceptionMessage, Step, TransactionID)
+    VALUES (ERROR_MESSAGE(), ''Step of Script sauce2'', NEWID());
+
+    -- Optionally, rethrow the error if you want to propagate it
+    THROW;
+END CATCH;
+', 
+		@database_name=N'Raw_Data', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Shift new Rows from Sauce2 to Sauce2_Stg]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Shift new Rows from Sauce2 to Sauce2_Stg', 
+		@step_id=4, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'DECLARE @columns NVARCHAR(MAX);
+DECLARE @sql NVARCHAR(MAX);
+
+-- Step 1: Dynamically retrieve the column names from the source table `dbo.Sauce2`
+-- Assuming both tables have the same columns
+
+SELECT @columns = STRING_AGG(QUOTENAME(COLUMN_NAME), '', '') 
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = ''Sauce2''
+AND TABLE_SCHEMA = ''dbo''  and COLUMN_NAME not in
+ ( ''Bulk_Insert_DateTime''  , ''IsShifted'' ) ;
+
+-- Step 2: Build the dynamic SQL for the INSERT ... EXCEPT operation
+SET @sql = N''
+    INSERT INTO dbo.Sauce2_Stg ('' + @columns + '')
+    SELECT '' + @columns + ''
+    FROM dbo.Sauce2
+    EXCEPT
+    SELECT '' + @columns + ''
+    FROM dbo.Sauce2_Stg;
+'';
+
+-- Step 3: Execute the dynamic SQL
+EXEC sp_executesql @sql;
+', 
+		@database_name=N'Raw_Data', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Sauce2_STG  to  Sauce2_CLEAN]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Sauce2_STG  to  Sauce2_CLEAN', 
+		@step_id=5, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'
+use [Raw_Data]
+--SET NOCOUNT ON;
+BEGIN TRY
+    -- Start a transaction
+    BEGIN TRANSACTION;
+
+    -- Create a logging table for exception handling
+    IF NOT EXISTS (SELECT * FROM sys.objects 
+                   WHERE object_id = OBJECT_ID(N''[dbo].[ExceptionLog]'') AND type IN (N''U''))
+    BEGIN
+        CREATE TABLE ExceptionLog (
+            LogID INT IDENTITY(1,1) PRIMARY KEY,
+            LogDateTime DATETIME DEFAULT GETDATE(),
+            ExceptionMessage NVARCHAR(MAX),
+            Step NVARCHAR(100),
+            TransactionID UNIQUEIDENTIFIER NULL -- To capture the transaction context
+        )
+    END
+
+    -- =====================================
+    -- Check if Sauce2_Stg exists and update intelligently
+    -- =====================================
+    
+    DECLARE @results TABLE
+    (
+        ID VARCHAR(36),
+        TableName VARCHAR(250),
+        ColumnName VARCHAR(250),
+        DataType VARCHAR(250),
+        MaxLength VARCHAR(250),
+        Longest VARCHAR(250),
+        SQLText VARCHAR(MAX)
+    )
+
+    -- Insert column info and dynamic SQL for each column
+    INSERT INTO @results(ID, TableName, ColumnName, DataType, MaxLength, Longest, SQLText)
+    SELECT 
+        NEWID(),
+        OBJECT_NAME(c.object_id),
+        c.name,
+        t.name,
+        CASE 
+            WHEN t.name != ''varchar'' THEN ''NA''
+            WHEN c.max_length = -1 THEN ''Max'' 
+            ELSE CAST(c.max_length AS VARCHAR)
+        END,
+        ''NA'',
+        ''SELECT MAX(LEN(ISNULL('' + QUOTENAME(c.name) + '', ''''''''))) FROM '' + QUOTENAME(OBJECT_SCHEMA_NAME(c.object_id)) + ''.'' + QUOTENAME(OBJECT_NAME(c.object_id))
+    FROM [Raw_Data].sys.columns c
+    INNER JOIN [Raw_Data].sys.types t ON c.system_type_id = t.system_type_id
+    WHERE c.object_id = OBJECT_ID(''Sauce2_Stg'')  -- Specify your table here
+
+	IF (SELECT COUNT(*) FROM @results) > 0
+BEGIN
+    PRINT ''Rows inserted into @results table:''
+ 
+END
+ELSE
+BEGIN
+    PRINT ''No rows inserted. Check if the table exists and has varchar columns.'';
+END
+
+    -- Execute the dynamic SQL to determine the longest length
+    DECLARE @id VARCHAR(36)
+    DECLARE @sql VARCHAR(MAX)
+    DECLARE @receiver TABLE(theCount INT)
+
+    DECLARE length_cursor CURSOR FOR 
+        SELECT ID, SQLText FROM @results WHERE MaxLength != ''NA''
+
+    OPEN length_cursor
+    FETCH NEXT FROM length_cursor INTO @id, @sql
+
+    WHILE @@FETCH_STATUS = 0
+    BEGIN
+
+        INSERT INTO @receiver (theCount)
+        EXEC(@sql)
+		
+        UPDATE @results
+        SET Longest = (SELECT theCount FROM @receiver)
+        WHERE ID = @id
+
+        DELETE FROM @receiver
+        FETCH NEXT FROM length_cursor INTO @id, @sql
+    END
+
+    CLOSE length_cursor
+    DEALLOCATE length_cursor
+
+    -- ============================
+    -- Intelligent Handling of Sauce2_Stg
+    -- ============================
+USE[DB_Warehouse]
+
+    IF OBJECT_ID(''dbo.Sauce2_Clean'', ''U'') IS NOT NULL
+    BEGIN
+        -- Sauce2_Stg already exists, let''s update it intelligently
+		
+        DECLARE @existingColumns TABLE
+        (
+            ColumnName VARCHAR(250),
+            DataType VARCHAR(250),
+            MaxLength INT
+        )
+        
+        -- Get the current structure of Sauce2_Stg
+        INSERT INTO @existingColumns(ColumnName, DataType, MaxLength)
+        SELECT 
+            c.name AS ColumnName,
+            t.name AS DataType,
+            CASE WHEN c.max_length = -1 THEN -1 ELSE c.max_length END AS MaxLength
+        FROM DB_Warehouse.sys.columns c
+        JOIN DB_Warehouse.sys.types t ON c.system_type_id = t.system_type_id
+        WHERE c.object_id = OBJECT_ID(''dbo.Sauce2_Clean'')
+
+        -- Now loop through the @results and intelligently update or create columns
+        DECLARE @columnName VARCHAR(250)
+        DECLARE @dataType VARCHAR(250)
+        DECLARE @maxLength VARCHAR(250)
+        DECLARE @longest VARCHAR(250)
+        DECLARE @alterSQL VARCHAR(MAX)
+        DECLARE @existingDataType VARCHAR(250)
+        DECLARE @existingMaxLength INT
+
+        DECLARE columns_cursor CURSOR FOR
+            SELECT ColumnName, DataType, MaxLength, ISNULL(Longest, 10)
+            FROM @results
+
+			--select * from @existingColumns
+
+        OPEN columns_cursor
+        FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+		PRINT(100)
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+		
+            -- Check if the column already exists
+            IF EXISTS (SELECT 1 FROM @existingColumns WHERE ColumnName = @columnName)
+            BEGIN
+                -- Column exists, check if data type matches and handle length change
+                SELECT @existingDataType = DataType, @existingMaxLength = MaxLength
+                FROM @existingColumns
+                WHERE ColumnName = @columnName
+
+				
+                IF @existingDataType = @dataType AND @dataType = ''varchar''
+                BEGIN
+                    -- If it''s varchar, check if we need to update the size
+                    IF @longest > @existingMaxLength
+                    BEGIN
+                        -- Increase the column size
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ALTER COLUMN '' + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+                        EXEC(@alterSQL)
+                    END
+                END
+                ELSE IF @existingDataType != @dataType
+                BEGIN
+                    -- If there''s a type mismatch, create a new column with a unique name
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ADD '' + QUOTENAME(@columnName + ''_new'') + '' '' + @dataType
+                    EXEC(@alterSQL)
+                END
+				
+            END
+            ELSE
+            BEGIN
+			
+                -- Column does not exist, so create it
+                IF @dataType = ''varchar''
+                BEGIN
+                    IF @maxLength = ''Max''
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + ''(MAX)''
+                    ELSE
+                        SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+                END
+                ELSE IF @dataType = ''datetime''
+                BEGIN
+                    -- Handle datetime columns, allowing NULLs if necessary
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ADD '' + QUOTENAME(@columnName) + '' '' + @dataType + '' NULL''
+                END
+                ELSE
+                BEGIN
+                    -- Non-varchar and non-datetime types
+                    SET @alterSQL = ''ALTER TABLE dbo.Sauce2_Clean ADD '' + QUOTENAME(@columnName) + '' '' + @dataType
+                END
+
+				
+		        SET @alterSQL = REPLACE(@alterSQL, ''(0)'', ''(100) '') + '';''
+                EXEC(@alterSQL)
+				PRINT(2)
+            END
+
+            FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+        END
+
+        CLOSE columns_cursor
+        DEALLOCATE columns_cursor
+    END
+    ELSE
+    BEGIN
+        -- Sauce2_Stg does not exist, create it
+        DECLARE @createTableSQL VARCHAR(MAX)
+        SET @createTableSQL = ''CREATE TABLE DB_Warehouse.dbo.Sauce2_Clean (''
+		
+        DECLARE @firstColumn BIT
+        SET @firstColumn = 1
+
+        -- Loop through the @results to build the CREATE TABLE statement
+        DECLARE columns_cursor CURSOR FOR
+            SELECT ColumnName, DataType, MaxLength, ISNULL(Longest, 10)
+            FROM @results
+
+			
+        OPEN columns_cursor
+        FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+		
+        WHILE @@FETCH_STATUS = 0
+        BEGIN
+		print(100)
+            IF @firstColumn = 0
+                SET @createTableSQL = @createTableSQL + '',''
+
+            SET @firstColumn = 0
+
+            IF @dataType = ''varchar''
+            BEGIN
+                IF @maxLength = ''Max''
+                    SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + ''(MAX)''
+                ELSE
+                    SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + ''('' + @longest + '')''
+            END
+            ELSE IF @dataType = ''datetime''
+            BEGIN
+                -- Handle datetime columns, allowing NULLs if necessary
+                SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType + '' NULL''
+            END
+            ELSE
+            BEGIN
+                -- Non-varchar and non-datetime columns
+                SET @createTableSQL = @createTableSQL + QUOTENAME(@columnName) + '' '' + @dataType
+            END
+
+            FETCH NEXT FROM columns_cursor INTO @columnName, @dataType, @maxLength, @longest
+        END
+
+        CLOSE columns_cursor
+        DEALLOCATE columns_cursor
+
+        -- Close CREATE TABLE statement
+       -- SET @createTableSQL = @createTableSQL + '');''
+		SET @createTableSQL = REPLACE(@createTableSQL, ''(0)'', ''(100) '') + '');''
+	
+
+        -- Execute the dynamic SQL to create the table
+        EXEC(@createTableSQL)
+		
+    END
+
+    -- Commit transaction if everything is successful
+    COMMIT TRANSACTION;
+    INSERT INTO ExceptionLog (ExceptionMessage, Step, TransactionID)
+    VALUES (''Successfully Executed Script Sauce2'', ''COMMIT CHANGES END TRY BLOCK'', NEWID());
+END TRY
+BEGIN CATCH
+    -- Rollback in case of error
+    IF @@TRANCOUNT > 0
+    BEGIN
+        ROLLBACK TRANSACTION;
+    END
+
+    -- Log the error in ExceptionLog table
+    INSERT INTO ExceptionLog (ExceptionMessage, Step, TransactionID)
+    VALUES (ERROR_MESSAGE(), ''Step of Script Sauce2'', NEWID());
+
+    -- Optionally, rethrow the error if you want to propagate it
+    THROW;
+END CATCH;
+', 
+		@database_name=N'Raw_Data', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Insert Clean data with NOT NULL CASE No in Sauce1_Clean]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Insert Clean data with NOT NULL CASE No in Sauce1_Clean', 
+		@step_id=6, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'DECLARE @columns NVARCHAR(MAX);
+DECLARE @sql NVARCHAR(MAX);
+
+-- Step 1: Dynamically retrieve the column names from the source table `dbo.Sauce2`
+-- Assuming both tables have the same columns
+
+SELECT @columns = STRING_AGG(QUOTENAME(COLUMN_NAME), '', '') 
+FROM Raw_Data.INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME = ''Sauce2_stg''
+AND TABLE_SCHEMA = ''dbo''  and COLUMN_NAME not in
+ ( ''Bulk_Insert_DateTime''  , ''IsShifted'' ) ;
+
+-- Step 2: Build the dynamic SQL for the INSERT ... EXCEPT operation
+SET @sql = N''
+    INSERT INTO DB_Warehouse.dbo.Sauce2_Clean ('' + @columns + '')
+    SELECT '' + @columns + ''
+    FROM Raw_Data.dbo.Sauce2_stg --where  len(case_no) >1
+	--and case_no not in (''''MA Courts Raw'''',	''''CASEINIT'''')
+	--and  len(owner_state) >1
+    EXCEPT
+    SELECT '' + @columns + ''
+    FROM DB_Warehouse.dbo.Sauce2_Clean;
+'';
+
+-- Step 3: Execute the dynamic SQL
+EXEC sp_executesql @sql;
+', 
+		@database_name=N'Raw_Data', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [CLEAN Sauce 1 Remove Duplicates & Fill LookupColumns & Stacked Column]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'CLEAN Sauce 1 Remove Duplicates & Fill LookupColumns & Stacked Column', 
+		@step_id=7, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'
+
+  
+--  update  [DB_Warehouse].[dbo].[Sauce1_Clean]
+--  set [Look_Out_Of_State] = 0
+--  where Subject_Property_State, Owner_State = ''MA'' or Fudiciary_No1_State = ''MA'' or
+--  Fudiciary_No1_State like ''MA %'' or Fudiciary_No1_State like  ''Mass%''
+--or  Subject_Property_State = ''MA'';
+
+
+WITH CTE AS (
+    SELECT 
+        case_no,
+        File_Name,
+        ROW_NUMBER() OVER(PARTITION BY case_no ORDER BY File_Name) AS RowNum
+    FROM 
+       DB_Warehouse.[dbo].[Sauce1_Clean] 
+)
+
+delete  FROM CTE
+WHERE RowNum > 1  ;
+
+
+
+
+
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean]
+  set [Look_next_event] = 0;
+
+     update  [DB_Warehouse].[dbo].[Sauce1_Clean]
+  set [Look_next_event] = 1
+  where len(Next_Event) >1  and Next_Event >= getDate()-1;
+
+
+-- IF we dont have case status we make it Active.
+
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean]
+  set Case_Status = ''Active''
+  where Case_Status  not in ( ''Closed''  )
+  or Case_Status is null; 
+
+
+
+--ALTER TABLE [DB_Warehouse].[dbo].[Sauce1_Clean]
+--DROP COLUMN Look_DateTime;
+
+--ALTER TABLE [DB_Warehouse].[dbo].[Sauce1_Clean]
+--ADD Look_DateTime DATETIME DEFAULT GETDATE();
+
+
+  
+delete from   [DB_Warehouse].[dbo].[Sauce1_Clean]
+where (File_Name like ''%Proba%'' or File_Name like ''Proba%'')
+and sheet_name in( ''No Bond & Closed'' , ''Closed'');
+
+
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 1 where File_Name like ''TAX1%'' 
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 1 where File_Name like ''%TAX1%''
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 2 where File_Name like ''TAX2%'' 
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 2 where File_Name like ''%TAX2%'' 
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 3 where File_Name like ''TAX3%'' 
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 3 where File_Name like ''%TAX3%'' 
+
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 4 where File_Name like ''Evict%''
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 4 where File_Name like ''%Evict%''
+   update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 1 where File_Name like ''Sauce 1 Data - Tax%'' 
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean]	 set Look_Sauce_Type = 6 where File_Name is null;
+
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 5 where File_Name like ''Proba%'' and sheet_name = ''Bond with RE'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 5 where File_Name like ''Proba%'' and sheet_name = ''Data'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 7 where File_Name like ''Proba%'' and sheet_name = ''Voluntary'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 8 where File_Name like ''Proba%'' and sheet_name = ''Bond without OCR'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 9 where File_Name like ''Proba%'' and sheet_name = ''No Bond & Active'';
+  
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 5 where File_Name like ''%Proba%'' and sheet_name = ''Bond with RE''; 
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 5 where File_Name like ''%Proba%'' and sheet_name = ''Data'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 7 where File_Name like ''%Proba%'' and sheet_name = ''Voluntary'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 8 where File_Name like ''%Proba%'' and sheet_name = ''Bond without OCR'' ;
+  update  [DB_Warehouse].[dbo].[Sauce1_Clean] set Look_Sauce_Type = 9 where File_Name like ''%Proba%'' and sheet_name = ''No Bond & Active''; 
+
+
+
+  
+  --- create stack column values
+
+  
+update A
+set A.stacked = B.stacked
+from  [DB_Warehouse].[dbo].[Sauce1_clean] A inner join (
+
+
+select Subject_Property_Address, case when len(stacklen) >2 then stacked else ''NA'' end as stacked
+FROM(
+
+SELECT 
+    Subject_Property_Address, STRING_AGG( look_sauce_type,''_ '') stacklen, 
+    STRING_AGG(case when look_sauce_type in( 1) then ''TaxDelinq''
+	when look_sauce_type = 2 then ''EVIC''
+	when look_sauce_type =3 then ''PROB'' end, ''_ '') AS stacked
+FROM (
+    SELECT DISTINCT Subject_Property_Address, LTRIM(RTRIM(case when look_sauce_type in(1,2,3) then 1 -- TAX
+	 when look_sauce_type = 4 then 2 -- EVIC
+	when look_sauce_type in (5,7,8,9) then 3 --PROB
+	else 0 end ))look_sauce_type
+    FROM [DB_Warehouse].[dbo].[Sauce1_Clean] where len ( Subject_Property_Address ) >1 
+--and subject_property_address =''0 Centre St''
+) AS unique_types
+GROUP BY 
+    Subject_Property_Address
+     ) as SUPERSTACK
+	 ) as B on A.Subject_Property_Address = B.Subject_Property_Address
+  where ( A.stacked is null or  len(A.stacked) <1)
+
+  ------ end stack updation
+
+
+
+
+
+  delete FROM [DB_Warehouse].[dbo].[Sauce1_Clean]
+  where len( Estimated_Value_of_Real_Estate) = 0 and Look_Sauce_Type in ( 5,7,8,9);', 
+		@database_name=N'DB_Warehouse', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [Lead Split in Sauce2 clean]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'Lead Split in Sauce2 clean', 
+		@step_id=8, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N'insert into [dbo].[Sauce2_Clean_All] (  [MLS_Record_Count]
+      ,[IsShifted]
+      ,[Bulk_Insert_DateTime]
+      ,[Total_Outstanding_All_Mortgage_Amounts]
+      ,[Already_Sold]
+      ,[Book_Page]
+      ,[DocNo]
+      ,[Document_Image]
+      ,[Last_Tax_Taking_Date]
+      ,[Tax_Taking_Document]
+      ,[Type]
+      ,[Order_of_Notice_Mortgage_Recorded_Date]
+      ,[Average_Property_Estimated_Value]
+      ,[Desc]
+      ,[Doc_Date]
+      ,[Seller_1_Full_Name]
+      ,[Seller_1_Firstname]
+      ,[Amount]
+      ,[Recorded_Date]
+      ,[Seller_1_Abbreviation]
+      ,[Seller_2_Full_Name]
+      ,[Seller_2_Firstname]
+      ,[Seller_2_Middle_Initial]
+      ,[Gtee_1_Full_Name]
+      ,[Gtee_1_Firstname]
+      ,[Gtee_1_Middle_Initial]
+      ,[Gtee_1_Lastname]
+      ,[Seller_1_Middle_Initial]
+      ,[Seller_1_Lastname]
+      ,[Gtee_2_Firstname]
+      ,[Gtee_2_Middle_Initial]
+      ,[Gtee_2_Lastname]
+      ,[Gtee_2_Abbreviation]
+      ,[Seller_2_Lastname]
+      ,[Seller_2_Abbreviation]
+      ,[PS_Wireless_phone_2]
+      ,[PS_Voip_phone_2]
+      ,[PS_Wireless_phone_3]
+      ,[PS_Voip_phone_3]
+      ,[Gtee_1_Abbreviation]
+      ,[Gtee_2_Full_Name]
+      ,[PS_Landline_phone_3]
+      ,[Subject_Property_Address]
+      ,[Subject_Property_Unit]
+      ,[Subject_Property_City]
+      ,[PS_Wireless_phone_1]
+      ,[PS_Voip_phone_1]
+      ,[Seller1_Assessed_Address]
+      ,[Seller1_Assessed_Unit]
+      ,[Seller1_Assessed_City]
+      ,[Seller1_Assessed_State]
+      ,[PS_Landline_phone_1]
+      ,[PS_Landline_phone_2]
+      ,[Last_Sale_Price]
+      ,[Land_Value]
+      ,[Building_Value]
+      ,[Total_Value]
+      ,[Subject_Property_State]
+ 
+      ,[MLS_Number]
+      ,[Style]
+      ,[Year_Built]
+      ,[Basement_Type]
+      ,[Seller1_Assessed_Zipcode]
+      ,[Last_Sale_Date]
+      ,[Last_Sale_Page]
+      ,[Misc_Improv]
+      ,[Fiscal_Year]
+      ,[Estimated_Tax]
+      ,[Owner_1]
+      ,[Owner_2]
+      ,[Tax_Rate_Ind]
+      ,[Tax_Amount]
+      ,[Tax_RateRes]
+      ,[Tax_RateComm]
+      ,[Total_Living_Area]
+      ,[Last_Sale_Book]
+      ,[Buyer_Name]
+      ,[Seller_Name]
+      ,[Lender_Name]
+      ,[Sale_Book]
+      ,[Tax_Rate_Res]
+      ,[Tax_Rate_Comm]
+      ,[Mortgage_Page]
+      ,[Recent_Mortgage_Date]
+      ,[Recent_Mortgage_Price]
+      ,[Discharge_Book]
+      ,[Sale_Price]
+      ,[Sale_Date]
+      ,[MLS_Last_List_Date]
+      ,[MLS_SEARCH_METHOD]
+      ,[File_Name]
+      ,[Sheet_Name]
+      ,[Sale_Page]
+      ,[Mortgage_Book]
+      ,[TPS_mobile_phone_2]
+      ,[TPS_mobile_phone_1]
+      ,[Mortgage_4_Amount]
+      ,[Mortgage_3_Recorded_Date]
+      ,[Discharge_Page]
+      ,[Discharge_Date]
+      ,[Mortgage_3_Amount]
+      ,[Mortgage_4_Recorded_Date]
+      ,[Mortgage_5_Recorded_Date]
+      ,[Mortgage_2_Amount]
+      ,[TPS_mobile_phone_3]
+      ,[TPS_landline_phone_1]
+      ,[Mortgage_4_Estimated_Payoff]
+      ,[Mortgage_3_Estimated_Payoff]
+      ,[TPS_landline_phone_3]
+      ,[TPS_landline_phone_2]
+      ,[Mortgage_2_Recorded_Date]
+      ,[Mortgage_5_Amount]
+      ,[StreetNumber]
+      ,[StreetName]
+      ,[Raw_Address]
+      ,[NumberOfPages]
+      ,[Mortgage_2_Estimated_Payoff]
+      ,[Mortgage_5_Estimated_Payoff]
+      ,[DocStatus]
+      ,[Gtor_2_Is_Estate]
+      ,[Gtor_1_Is_Estate]
+      ,[BookPage]
+      ,[Consideration]
+      ,[RecordDate]
+      ,[Gtee_2_Is_Estate]
+      ,[Mortgage_3_bk_pg]
+      ,[Gtor_3_Is_Estate]
+      ,[Mortgage_4_bk_pg]
+      ,[DocNumber]
+      ,[TypeDesc]
+      ,[Mortgage_5_bk_pg]
+      ,[Gtee_3_Is_Estate]
+      ,[Gtee_4_Is_Estate]
+      ,[Gtor_4_Is_Estate]
+      ,[RecordTime]
+      ,[Gtee_1_Is_Estate]
+      ,[Stacked] )
+
+
+SELECT    [MLS_Record_Count]
+      ,[IsShifted]
+      ,[Bulk_Insert_DateTime]
+      ,[Total_Outstanding_All_Mortgage_Amounts]
+      ,[Already_Sold]
+      ,[Book_Page]
+      ,[DocNo]
+      ,[Document_Image]
+      ,[Last_Tax_Taking_Date]
+      ,[Tax_Taking_Document]
+      ,[Type]
+      ,[Order_of_Notice_Mortgage_Recorded_Date]
+      ,[Average_Property_Estimated_Value]
+      ,[Desc]
+      ,[Doc_Date]
+      ,[Gtor_1_Full_Name]
+      ,[Gtor_1_Firstname]
+      ,[Amount]
+      ,[Recorded_Date]
+      ,[Gtor_1_Abbreviation]
+      ,[Gtor_2_Full_Name]
+      ,[Gtor_2_Firstname]
+      ,[Gtor_2_Middle_Initial]
+      ,[Gtee_1_Full_Name]
+      ,[Gtee_1_Firstname]
+      ,[Gtee_1_Middle_Initial]
+      ,[Gtee_1_Lastname]
+      ,[Gtor_1_Middle_Initial]
+      ,[Gtor_1_Lastname]
+      ,[Gtee_2_Firstname]
+      ,[Gtee_2_Middle_Initial]
+      ,[Gtee_2_Lastname]
+      ,[Gtee_2_Abbreviation]
+      ,[Gtor_2_Lastname]
+      ,[Gtor_2_Abbreviation]
+      ,[PS_Wireless_phone_2]
+      ,[PS_Voip_phone_2]
+      ,[PS_Wireless_phone_3]
+      ,[PS_Voip_phone_3]
+      ,[Gtee_1_Abbreviation]
+      ,[Gtee_2_Full_Name]
+      ,[PS_Landline_phone_3]
+      ,[Street_Address]
+      ,[Unit]
+      ,[Town]
+      ,[PS_Wireless_phone_1]
+      ,[PS_Voip_phone_1]
+      ,[Owner_Address]
+      ,[Owner_Unit]
+      ,[Owner_City]
+      ,[Owner_State]
+      ,[PS_Landline_phone_1]
+      ,[PS_Landline_phone_2]
+      ,[Last_Sale_Price]
+      ,[Land_Value]
+      ,[Building_Value]
+      ,[Total_Value]
+      ,[State]
+      ,[MLS_Number]
+      ,[Style]
+      ,[Year_Built]
+      ,[Basement_Type]
+      ,[Owner_Zipcode]
+      ,[Last_Sale_Date]
+      ,[Last_Sale_Page]
+      ,[Misc_Improv]
+      ,[Fiscal_Year]
+      ,[Estimated_Tax]
+      ,[Owner_1]
+      ,[Owner_2]
+      ,[Tax_Rate_Ind]
+      ,[Tax_Amount]
+      ,[Tax_RateRes]
+      ,[Tax_RateComm]
+      ,[Total_Living_Area]
+      ,[Last_Sale_Book]
+      ,[Buyer_Name]
+      ,[Seller_Name]
+      ,[Lender_Name]
+      ,[Sale_Book]
+      ,[Tax_Rate_Res]
+      ,[Tax_Rate_Comm]
+      ,[Mortgage_Page]
+      ,[Recent_Mortgage_Date]
+      ,[Recent_Mortgage_Price]
+      ,[Discharge_Book]
+      ,[Sale_Price]
+      ,[Sale_Date]
+      ,[MLS_Last_List_Date]
+      ,[MLS_SEARCH_METHOD]
+      ,[File_Name]
+      ,[Sheet_Name]
+      ,[Sale_Page]
+      ,[Mortgage_Book]
+      ,[TPS_mobile_phone_2]
+      ,[TPS_mobile_phone_1]
+      ,[Mortgage_4_Amount]
+      ,[Mortgage_3_Recorded_Date]
+      ,[Discharge_Page]
+      ,[Discharge_Date]
+      ,[Mortgage_3_Amount]
+      ,[Mortgage_4_Recorded_Date]
+      ,[Mortgage_5_Recorded_Date]
+      ,[Mortgage_2_Amount]
+      ,[TPS_mobile_phone_3]
+      ,[TPS_landline_phone_1]
+      ,[Mortgage_4_Estimated_Payoff]
+      ,[Mortgage_3_Estimated_Payoff]
+      ,[TPS_landline_phone_3]
+      ,[TPS_landline_phone_2]
+      ,[Mortgage_2_Recorded_Date]
+      ,[Mortgage_5_Amount]
+      ,[StreetNumber]
+      ,[StreetName]
+      ,[Raw_Address]
+      ,[NumberOfPages]
+      ,[Mortgage_2_Estimated_Payoff]
+      ,[Mortgage_5_Estimated_Payoff]
+      ,[DocStatus]
+      ,[Gtor_2_Is_Estate]
+      ,[Gtor_1_Is_Estate]
+      ,[BookPage]
+      ,[Consideration]
+      ,[RecordDate]
+      ,[Gtee_2_Is_Estate]
+      ,[Mortgage_3_bk_pg]
+      ,[Gtor_3_Is_Estate]
+      ,[Mortgage_4_bk_pg]
+      ,[DocNumber]
+      ,[TypeDesc]
+      ,[Mortgage_5_bk_pg]
+      ,[Gtee_3_Is_Estate]
+      ,[Gtee_4_Is_Estate]
+      ,[Gtor_4_Is_Estate]
+      ,[RecordTime]
+      ,[Gtee_1_Is_Estate]
+      ,[Stacked] 
+	  from [dbo].[Sauce2_Clean] where [DocNo] not in ( select distinct [DocNo] from [dbo].[Sauce2_Clean_All] )', 
+		@database_name=N'DB_Warehouse', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [dup delete]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'dup delete', 
+		@step_id=9, 
+		@cmdexec_success_code=0, 
+		@on_success_action=3, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N';WITH CTE AS (
+    SELECT  * , ROW_NUMBER() OVER (PARTITION BY 
+      [MLS_Record_Count]
+      ----,[IsShifted]
+     -- ,[Bulk_Insert_DateTime]
+      ,[Total_Outstanding_All_Mortgage_Amounts]
+      ,[Already_Sold]
+      ,[Book_Page]
+      ,[DocNo]
+      ,[Document_Image]
+      ,[Last_Tax_Taking_Date]
+      ,[Tax_Taking_Document]
+      ,[Type]
+      ,[Order_of_Notice_Mortgage_Recorded_Date]
+      ,[Average_Property_Estimated_Value]
+      ,[Desc]
+      ,[Doc_Date]
+      ,[Seller_1_Full_Name]
+      ,[Seller_1_Firstname]
+      ,[Amount]
+      ,[Recorded_Date]
+      ,[Seller_1_Abbreviation]
+      ,[Seller_2_Full_Name]
+      ,[Seller_2_Firstname]
+      ,[Seller_2_Middle_Initial]
+      ,[Gtee_1_Full_Name]
+      ,[Gtee_1_Firstname]
+      ,[Gtee_1_Middle_Initial]
+      ,[Gtee_1_Lastname]
+      ,[Seller_1_Middle_Initial]
+      ,[Seller_1_Lastname]
+      ,[Gtee_2_Firstname]
+      ,[Gtee_2_Middle_Initial]
+      ,[Gtee_2_Lastname]
+      ,[Gtee_2_Abbreviation]
+      ,[Seller_2_Lastname]
+      ,[Seller_2_Abbreviation]
+      ,[PS_Wireless_phone_2]
+      ,[PS_Voip_phone_2]
+      ,[PS_Wireless_phone_3]
+      ,[PS_Voip_phone_3]
+      ,[Gtee_1_Abbreviation]
+      ,[Gtee_2_Full_Name]
+      ,[PS_Landline_phone_3]
+      ,[Subject_Property_Address]
+      ,[Subject_Property_Unit]
+      ,[Subject_Property_City]
+      ,[PS_Wireless_phone_1]
+      ,[PS_Voip_phone_1]
+      ,[Seller1_Assessed_Address]
+      ,[Seller1_Assessed_Unit]
+      ,[Seller1_Assessed_City]
+      ,[Seller1_Assessed_State]
+      ,[PS_Landline_phone_1]
+      ,[PS_Landline_phone_2]
+      ,[Last_Sale_Price]
+      ,[Land_Value]
+      ,[Building_Value]
+      ,[Total_Value]
+      ,[Subject_Property_State]
+      ,[Subject_Property_Zipcode]
+      ,[MLS_Number]
+      ,[Style]
+      ,[Year_Built]
+      ,[Basement_Type]
+      ,[Seller1_Assessed_Zipcode]
+      ,[Last_Sale_Date]
+      ,[Last_Sale_Page]
+      ,[Misc_Improv]
+      ,[Fiscal_Year]
+      ,[Estimated_Tax]
+      ,[Owner_1]
+      ,[Owner_2]
+      ,[Tax_Rate_Ind]
+      ,[Tax_Amount]
+      ,[Tax_RateRes]
+      ,[Tax_RateComm]
+      ,[Total_Living_Area]
+      ,[Last_Sale_Book]
+      ,[Buyer_Name]
+      ,[Seller_Name]
+      ,[Lender_Name]
+      ,[Sale_Book]
+      ,[Tax_Rate_Res]
+      ,[Tax_Rate_Comm]
+      ,[Mortgage_Page]
+      ,[Recent_Mortgage_Date]
+      ,[Recent_Mortgage_Price]
+      ,[Discharge_Book]
+      ,[Sale_Price]
+      ,[Sale_Date]
+      ,[MLS_Last_List_Date]
+      ,[MLS_SEARCH_METHOD]
+     -- ,[File_Name]
+     -- ,[Sheet_Name]
+      ,[Sale_Page]
+      ,[Mortgage_Book]
+      ,[TPS_mobile_phone_2]
+      ,[TPS_mobile_phone_1]
+      ,[Mortgage_4_Amount]
+      ,[Mortgage_3_Recorded_Date]
+      ,[Discharge_Page]
+      ,[Discharge_Date]
+      ,[Mortgage_3_Amount]
+      ,[Mortgage_4_Recorded_Date]
+      ,[Mortgage_5_Recorded_Date]
+      ,[Mortgage_2_Amount]
+      ,[TPS_mobile_phone_3]
+      ,[TPS_landline_phone_1]
+      ,[Mortgage_4_Estimated_Payoff]
+      ,[Mortgage_3_Estimated_Payoff]
+      ,[TPS_landline_phone_3]
+      ,[TPS_landline_phone_2]
+      ,[Mortgage_2_Recorded_Date]
+      ,[Mortgage_5_Amount]
+      ,[StreetNumber]
+      ,[StreetName]
+      ,[Raw_Address]
+      ,[NumberOfPages]
+      ,[Mortgage_2_Estimated_Payoff]
+      ,[Mortgage_5_Estimated_Payoff]
+      ,[DocStatus]
+      ,[Gtor_2_Is_Estate]
+      ,[Gtor_1_Is_Estate]
+      ,[BookPage]
+      ,[Consideration]
+      ,[RecordDate]
+      ,[Gtee_2_Is_Estate]
+      ,[Mortgage_3_bk_pg]
+      ,[Gtor_3_Is_Estate]
+      ,[Mortgage_4_bk_pg]
+      ,[DocNumber]
+      ,[TypeDesc]
+      ,[Mortgage_5_bk_pg]
+      ,[Gtee_3_Is_Estate]
+      ,[Gtee_4_Is_Estate]
+      ,[Gtor_4_Is_Estate]
+      ,[RecordTime]
+      ,[Gtee_1_Is_Estate]
+      ,[Stacked] ORDER BY (SELECT NULL)) AS RowNum
+  FROM [DB_Warehouse].[dbo].[Sauce2_Clean_All]
+  )
+select count(*)  FROM cte where rownum > 1', 
+		@database_name=N'DB_Warehouse', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+/****** Object:  Step [delete duplicate subject_property_address]    Script Date: 11/29/2024 1:10:04 PM ******/
+EXEC @ReturnCode = msdb.dbo.sp_add_jobstep @job_id=@jobId, @step_name=N'delete duplicate subject_property_address', 
+		@step_id=10, 
+		@cmdexec_success_code=0, 
+		@on_success_action=1, 
+		@on_success_step_id=0, 
+		@on_fail_action=2, 
+		@on_fail_step_id=0, 
+		@retry_attempts=0, 
+		@retry_interval=0, 
+		@os_run_priority=0, @subsystem=N'TSQL', 
+		@command=N';with cte as (
+SELECT *, row_number() over ( partition by 
+      [MLS_Record_Count]
+      ,[IsShifted]
+     -- ,[Bulk_Insert_DateTime]
+      ,[Total_Outstanding_All_Mortgage_Amounts]
+      ,[Already_Sold]
+      ,[Book_Page]
+      ,[DocNo]
+      ,[Document_Image]
+      ,[Last_Tax_Taking_Date]
+      ,[Tax_Taking_Document]
+      ,[Type]
+      ,[Order_of_Notice_Mortgage_Recorded_Date]
+      ,[Average_Property_Estimated_Value]
+      ,[Desc]
+      ,[Street_Address]
+      ,[State]
+      ,[Doc_Date]
+      ,[Gtor_1_Full_Name]
+      ,[Gtor_1_Firstname]
+      ,[Amount]
+      ,[Recorded_Date]
+      ,[Gtor_1_Abbreviation]
+      ,[Gtor_2_Full_Name]
+      ,[Gtor_2_Firstname]
+      ,[Gtor_2_Middle_Initial]
+      ,[Unit]
+      ,[Town]
+      ,[Gtee_1_Full_Name]
+      ,[Gtee_1_Firstname]
+      ,[Gtee_1_Middle_Initial]
+      ,[Gtee_1_Lastname]
+      ,[Gtor_1_Middle_Initial]
+      ,[Gtor_1_Lastname]
+      ,[Gtee_2_Firstname]
+      ,[Gtee_2_Middle_Initial]
+      ,[Gtee_2_Lastname]
+      ,[Gtee_2_Abbreviation]
+      ,[Gtor_2_Lastname]
+      ,[Gtor_2_Abbreviation]
+      ,[PS_Wireless_phone_2]
+      ,[PS_Voip_phone_2]
+      ,[PS_Wireless_phone_3]
+      ,[PS_Voip_phone_3]
+      ,[Gtee_1_Abbreviation]
+      ,[Gtee_2_Full_Name]
+      ,[PS_Landline_phone_3]
+      ,[Subject_Property_Address]
+      ,[Subject_Property_Unit]
+      ,[Subject_Property_City]
+      ,[PS_Wireless_phone_1]
+      ,[PS_Voip_phone_1]
+      ,[Owner_Address]
+      ,[Owner_Unit]
+      ,[Owner_City]
+      ,[Owner_State]
+      ,[PS_Landline_phone_1]
+      ,[PS_Landline_phone_2]
+      ,[Last_Sale_Price]
+      ,[Land_Value]
+      ,[Building_Value]
+      ,[Total_Value]
+      ,[Subject_Property_State]
+      ,[Subject_Property_Zipcode]
+      ,[MLS_Number]
+      ,[Style]
+      ,[Year_Built]
+      ,[Basement_Type]
+      ,[Owner_Zipcode]
+      ,[Last_Sale_Date]
+      ,[Last_Sale_Page]
+      ,[Misc_Improv]
+      ,[Fiscal_Year]
+      ,[Estimated_Tax]
+      ,[Owner_1]
+      ,[Owner_2]
+      ,[Tax_Rate_Ind]
+      ,[Tax_Amount]
+      ,[Tax_RateRes]
+      ,[Tax_RateComm]
+      ,[Total_Living_Area]
+      ,[Last_Sale_Book]
+      ,[Buyer_Name]
+      ,[Seller_Name]
+      ,[Lender_Name]
+      ,[Sale_Book]
+      ,[Tax_Rate_Res]
+      ,[Tax_Rate_Comm]
+      ,[Mortgage_Page]
+      ,[Recent_Mortgage_Date]
+      ,[Recent_Mortgage_Price]
+      ,[Discharge_Book]
+      ,[Sale_Price]
+      ,[Sale_Date]
+      ,[MLS_Last_List_Date]
+      ,[MLS_SEARCH_METHOD]
+     -- ,[File_Name]
+      --,[Sheet_Name]
+      ,[Sale_Page]
+      ,[Mortgage_Book]
+      ,[TPS_mobile_phone_2]
+      ,[TPS_mobile_phone_1]
+      ,[Mortgage_4_Amount]
+      ,[Mortgage_3_Recorded_Date]
+      ,[Discharge_Page]
+      ,[Discharge_Date]
+      ,[Mortgage_3_Amount]
+      ,[Mortgage_4_Recorded_Date]
+      ,[Mortgage_5_Recorded_Date]
+      ,[Mortgage_2_Amount]
+      ,[TPS_mobile_phone_3]
+      ,[TPS_landline_phone_1]
+      ,[Mortgage_4_Estimated_Payoff]
+      ,[Mortgage_3_Estimated_Payoff]
+      ,[TPS_landline_phone_3]
+      ,[TPS_landline_phone_2]
+      ,[Mortgage_2_Recorded_Date]
+      ,[Mortgage_5_Amount]
+      ,[StreetNumber]
+      ,[StreetName]
+      ,[Raw_Address]
+      ,[NumberOfPages]
+      ,[Mortgage_2_Estimated_Payoff]
+      ,[Mortgage_5_Estimated_Payoff]
+      ,[DocStatus]
+      ,[Gtor_2_Is_Estate]
+      ,[Gtor_1_Is_Estate]
+      ,[BookPage]
+      ,[Consideration]
+      ,[RecordDate]
+      ,[Gtee_2_Is_Estate]
+      ,[Mortgage_3_bk_pg]
+      ,[Gtor_3_Is_Estate]
+      ,[Mortgage_4_bk_pg]
+      ,[DocNumber]
+      ,[TypeDesc]
+      ,[Mortgage_5_bk_pg]
+      ,[Gtee_3_Is_Estate]
+      ,[Gtee_4_Is_Estate]
+      ,[Gtor_4_Is_Estate]
+      ,[RecordTime]
+      ,[Gtee_1_Is_Estate]
+      ,[Stacked] order by (Select NULL)) as rownum
+  FROM [DB_Warehouse].[dbo].[Sauce2_Clean]
+)
+delete from cte where rownum >1', 
+		@database_name=N'DB_Warehouse', 
+		@flags=0
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_update_job @job_id = @jobId, @start_step_id = 1
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobschedule @job_id=@jobId, @name=N'2 Hourly', 
+		@enabled=1, 
+		@freq_type=4, 
+		@freq_interval=1, 
+		@freq_subday_type=8, 
+		@freq_subday_interval=2, 
+		@freq_relative_interval=0, 
+		@freq_recurrence_factor=0, 
+		@active_start_date=20241119, 
+		@active_end_date=99991231, 
+		@active_start_time=141500, 
+		@active_end_time=105959, 
+		@schedule_uid=N'40747176-4167-4e70-b979-4c0625bfa632'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+EXEC @ReturnCode = msdb.dbo.sp_add_jobserver @job_id = @jobId, @server_name = N'(local)'
+IF (@@ERROR <> 0 OR @ReturnCode <> 0) GOTO QuitWithRollback
+COMMIT TRANSACTION
+GOTO EndSave
+QuitWithRollback:
+    IF (@@TRANCOUNT > 0) ROLLBACK TRANSACTION
+EndSave:
+GO
+
+
